@@ -1,14 +1,7 @@
-// =======================================================
-// server.js - مراقب مباريات مباشر (يعمل على Render مع تجاوز Cloudflare)
-// =======================================================
-
 const express = require('express');
-const admin = require('firebase-admin');
+const fetch = require('node-fetch');
 const { JSDOM } = require('jsdom');
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-
-puppeteer.use(StealthPlugin());
+const admin = require('firebase-admin');
 
 const app = express();
 
@@ -20,73 +13,7 @@ admin.initializeApp({
 
 const TOPIC = 'matches';
 
-// ========== إعدادات الفحص الذكي ==========
-let CHECK_INTERVAL = 45_000;   // يبدأ بـ 45 ثانية
-let intervalId = null;
-let liveCount = 0;
-
-// ========== مسار Chromium المثبت بواسطة Render ==========
-const CHROMIUM_PATH = puppeteer.executablePath();
-console.log('📍 مسار Chromium:', CHROMIUM_PATH);
-
-// ========== جلب الصفحة باستخدام متصفح حقيقي (Puppeteer + Stealth) ==========
-async function fetchPage() {
-  const targetUrl = 'https://jdwel.com/today/';
-
-  console.log('🚀 [Puppeteer] تشغيل المتصفح...');
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    executablePath: CHROMIUM_PATH,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--single-process',
-    ],
-  });
-
-  try {
-    const page = await browser.newPage();
-
-    // تمويه ليبدو كمتصفح طبيعي
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
-    );
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    });
-
-    console.log('🌐 [Puppeteer] التوجه إلى الصفحة...');
-    await page.goto(targetUrl, {
-      waitUntil: 'networkidle2',
-      timeout: 40_000,
-    });
-
-    await page.waitForTimeout(3000);
-
-    // انتظار ظهور قائمة المباريات للتأكد من تحميل المحتوى
-    try {
-      await page.waitForSelector('.comp_matches_list', { timeout: 10_000 });
-      console.log('✅ [Puppeteer] ظهرت قائمة المباريات');
-    } catch (e) {
-      console.warn('⚠️ [Puppeteer] لم تظهر .comp_matches_list، قد يكون الهيكل تغير.');
-    }
-
-    const html = await page.content();
-    console.log('✅ [Puppeteer] تم جلب HTML بنجاح');
-    return html;
-  } catch (error) {
-    console.error('❌ [Puppeteer] فشل:', error.message);
-    throw error;
-  } finally {
-    await browser.close();
-    console.log('🧹 [Puppeteer] تم إغلاق المتصفح');
-  }
-}
-
-// ========== تحليل HTML ==========
+// ========== تحليل HTML (نفس السابق) ==========
 function parseMatches(html) {
   const dom = new JSDOM(html);
   const document = dom.window.document;
@@ -113,9 +40,8 @@ function parseMatches(html) {
       let minute = null;
       const minuteEl = matchEl.querySelector('.match_status .status_box span');
       if (minuteEl) {
-        const raw = minuteEl.textContent.trim();
-        const m = raw.match(/(\d+)(?:\+(\d+))?/);
-        if (m) minute = m[0]; // تحتفظ بصيغة "45+2"
+        const txt = minuteEl.textContent.replace(/[^0-9]/g, '');
+        if (txt) minute = parseInt(txt);
       }
 
       const linkEl = matchEl.querySelector('a[href]');
@@ -131,8 +57,6 @@ function parseMatches(html) {
         team1,
         team2,
         score,
-        homeScore: parseInt(scoreHome) || 0,
-        awayScore: parseInt(scoreAway) || 0,
         isLive,
         minute,
         matchId,
@@ -143,7 +67,10 @@ function parseMatches(html) {
   return matches;
 }
 
-// ========== إرسال إشعار ==========
+// ========== الحالة السابقة ==========
+let previousMatches = new Map();
+
+// ========== إرسال إشعار مع إعادة محاولة ==========
 async function sendNotification(title, body, retry = 2) {
   const message = {
     notification: { title, body },
@@ -152,82 +79,68 @@ async function sendNotification(title, body, retry = 2) {
   for (let i = 0; i < retry; i++) {
     try {
       await admin.messaging().send(message);
-      console.log(`✅ إشعار: ${title}`);
+      console.log('✅ إشعار:', title);
       return;
     } catch (error) {
-      console.error(`❌ محاولة ${i + 1} فشلت:`, error.message);
-      if (i < retry - 1) await new Promise(r => setTimeout(r, 2000));
+      console.error(`❌ محاولة ${i+1} فشلت:`, error.message);
+      if (i < retry-1) await new Promise(r => setTimeout(r, 2000));
     }
   }
 }
 
-// ========== الحالة السابقة ==========
-let previousMatches = new Map();
+// ========== جلب الصفحة عبر وكيل ==========
+async function fetchPage() {
+  // قائمة بالوكلاء الاحتياطيين
+  const proxyUrls = [
+    `https://api.allorigins.win/raw?url=${encodeURIComponent('https://jdwel.com/today/')}`,
+    `https://corsproxy.io/?${encodeURIComponent('https://jdwel.com/today/')}`,
+  ];
 
-// ========== دورة الفحص الرئيسية ==========
+  for (let url of proxyUrls) {
+    try {
+      const response = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProxyBot/1.0)' }
+      });
+      if (response.ok) return response.text();
+      console.log(`وكيل ${url} أعاد HTTP ${response.status}`);
+    } catch (err) {
+      console.log(`فشل الوكيل ${url}: ${err.message}`);
+    }
+  }
+  throw new Error('All proxies failed');
+}
+
+// ========== الفحص الدوري (محسّن) ==========
 async function checkMatches() {
   try {
-    console.log('\n🔍 بدء دورة فحص جديدة...');
+    console.log('🔍 جلب بيانات الموقع عبر وكيل...');
     const html = await fetchPage();
     const matches = parseMatches(html);
     const liveMatches = matches.filter(m => m.isLive && m.matchId);
-    liveCount = liveMatches.length;
-
     const currentMap = new Map();
     liveMatches.forEach(m => currentMap.set(m.matchId, m));
 
     for (const [id, match] of currentMap) {
       const prev = previousMatches.get(id);
 
-      // حالة 1: مباراة جديدة مباشرة
-      if (!prev) {
-        if (match.isLive) {
-          await sendNotification(
-            `⚽ بداية مباراة`,
-            `${match.team1} 🆚 ${match.team2} (${match.league})`
-          );
+      // حالة 1: مباراة جديدة تماماً (غير موجودة سابقاً) وهي مباشرة → إرسال بداية
+      if (!prev && match.isLive) {
+        await sendNotification(`⚽ بداية مباراة`, `${match.team1} 🆚 ${match.team2} (${match.league})`);
+        previousMatches.set(id, { isLive: true, score: match.score });
+        continue;
+      }
+
+      if (prev) {
+        // بداية المباراة: كانت غير مباشرة والآن مباشرة
+        if (!prev.isLive && match.isLive) {
+          await sendNotification(`⚽ بداية مباراة`, `${match.team1} 🆚 ${match.team2} (${match.league})`);
         }
-        previousMatches.set(id, {
-          isLive: match.isLive,
-          homeScore: match.homeScore,
-          awayScore: match.awayScore,
-          startNotified: true,
-        });
-        continue;
-      }
-
-      // حالة 2: تغيرت الحالة إلى مباشرة
-      if (!prev.isLive && match.isLive) {
-        await sendNotification(
-          `⚽ بداية مباراة`,
-          `${match.team1} 🆚 ${match.team2} (${match.league})`
-        );
-        previousMatches.set(id, {
-          isLive: true,
-          homeScore: match.homeScore,
-          awayScore: match.awayScore,
-          startNotified: true,
-        });
-        continue;
-      }
-
-      // حالة 3: هدف (تغيرت النتيجة)
-      if (
-        prev.isLive &&
-        match.isLive &&
-        (prev.homeScore !== match.homeScore || prev.awayScore !== match.awayScore)
-      ) {
-        await sendNotification(
-          `🥅 هدف!`,
-          `${match.team1} ${match.score} ${match.team2} | الدقيقة ${match.minute || '?'}`
-        );
+        // تسجيل هدف: تغيرت النسبة والمباراة مباشرة
+        if (prev.isLive && match.isLive && prev.score !== match.score) {
+          await sendNotification(`🥅 هدف!`, `${match.team1} ${match.score} ${match.team2} | الدقيقة ${match.minute || '?'}`);
+        }
         // تحديث الحالة المخزنة
-        previousMatches.set(id, {
-          isLive: true,
-          homeScore: match.homeScore,
-          awayScore: match.awayScore,
-          startNotified: true,
-        });
+        previousMatches.set(id, { isLive: match.isLive, score: match.score });
       }
     }
 
@@ -239,29 +152,21 @@ async function checkMatches() {
       }
     }
 
-    CHECK_INTERVAL = liveCount > 0 ? 45_000 : 180_000;
-    console.log(`📊 مباريات مباشرة: ${liveCount} | الفحص القادم بعد ${CHECK_INTERVAL / 1000} ث`);
+    console.log(`✅ تم فحص ${liveMatches.length} مباراة مباشرة - ${new Date().toLocaleTimeString()}`);
   } catch (error) {
     console.error('❌ خطأ في checkMatches:', error.message);
-    CHECK_INTERVAL = Math.min(CHECK_INTERVAL * 1.5, 300_000);
   }
-
-  // إعادة جدولة المؤقت
-  clearInterval(intervalId);
-  intervalId = setInterval(checkMatches, CHECK_INTERVAL);
 }
 
-// ========== تشغيل أولي ==========
+// ========== تقليل الفاصل الزمني لالتقاط الأهداف بشكل أسرع ==========
+setInterval(checkMatches, 15_000);  // من 30 ثانية إلى 15 ثانية
+
+// تنفيذ أول فوراً
 checkMatches();
 
-// ========== نقطة فحص الصحة ==========
+// ========== خادم Express ==========
 app.get('/', (req, res) => {
-  res.json({
-    status: '🟢 الخادم يعمل',
-    liveMatches: liveCount,
-    nextCheckInSeconds: CHECK_INTERVAL / 1000,
-    timestamp: new Date().toISOString(),
-  });
+  res.send('🟢 خادم مراقبة المباريات يعمل مع تحسين الإشعارات');
 });
 
 const PORT = process.env.PORT || 3000;
