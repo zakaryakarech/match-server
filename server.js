@@ -166,9 +166,13 @@ checkMatches();
 
 // ========== خادم Express ==========
 app.get('/', (req, res) => {
-  res.send('🟢 خادم مراقبة المباريات يعمل مع تحسين الإشعارات');
+  res.json({
+    status: '🟢 الخادم يعمل',
+    liveMatches: liveCount,
+    nextCheckInSeconds: CHECK_INTERVAL / 1000,
+    timestamp: new Date().toISOString(),
+  });
 });
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 الخادم يستمع على المنفذ ${PORT}`);
