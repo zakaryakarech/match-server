@@ -5,8 +5,7 @@ const admin = require('firebase-admin');
 
 const app = express();
 
-// ========== إعداد Firebase Admin ==========
-// نقرأ المفتاح من متغير البيئة SERVICE_ACCOUNT_JSON
+// ========== Firebase Admin ==========
 const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -14,7 +13,7 @@ admin.initializeApp({
 
 const TOPIC = 'matches';
 
-// ========== تحليل HTML ==========
+// ========== تحليل HTML (نفس السابق) ==========
 function parseMatches(html) {
   const dom = new JSDOM(html);
   const document = dom.window.document;
@@ -71,7 +70,7 @@ function parseMatches(html) {
 // ========== الحالة السابقة ==========
 let previousMatches = new Map();
 
-// ========== إرسال إشعار FCM ==========
+// ========== إرسال إشعار ==========
 async function sendNotification(title, body) {
   const message = {
     notification: { title, body },
@@ -85,36 +84,32 @@ async function sendNotification(title, body) {
   }
 }
 
-// ========== دالة جلب الصفحة مع ترويسة متصفح حقيقية ==========
+// ========== جلب الصفحة عبر وكيل ==========
 async function fetchPage() {
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-    'Cache-Control': 'max-age=0',
-  };
+  // قائمة بالوكلاء الاحتياطيين
+  const proxyUrls = [
+    `https://api.allorigins.win/raw?url=${encodeURIComponent('https://jdwel.com/today/')}`,
+    `https://corsproxy.io/?${encodeURIComponent('https://jdwel.com/today/')}`,
+  ];
 
-  // نجرب 3 مرات
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let url of proxyUrls) {
     try {
-      const response = await fetch('https://jdwel.com/today/', { headers });
+      const response = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProxyBot/1.0)' }
+      });
       if (response.ok) return response.text();
-      console.log(`محاولة ${attempt}: HTTP ${response.status}`);
+      console.log(`وكيل ${url} أعاد HTTP ${response.status}`);
     } catch (err) {
-      console.log(`محاولة ${attempt}: ${err.message}`);
+      console.log(`فشل الوكيل ${url}: ${err.message}`);
     }
-    await new Promise(r => setTimeout(r, 3000)); // انتظر 3 ثوان قبل إعادة المحاولة
   }
-  throw new Error('Failed to fetch after 3 attempts');
+  throw new Error('All proxies failed');
 }
 
 // ========== الفحص الدوري ==========
 async function checkMatches() {
   try {
-    console.log('🔍 جلب بيانات الموقع...');
+    console.log('🔍 جلب بيانات الموقع عبر وكيل...');
     const html = await fetchPage();
     const matches = parseMatches(html);
     const liveMatches = matches.filter(m => m.isLive && m.matchId);
@@ -128,16 +123,10 @@ async function checkMatches() {
         continue;
       }
       if (!prev.isLive && match.isLive) {
-        await sendNotification(
-          `⚽ بداية مباراة`,
-          `${match.team1} 🆚 ${match.team2} (${match.league})`
-        );
+        await sendNotification(`⚽ بداية مباراة`, `${match.team1} 🆚 ${match.team2} (${match.league})`);
       }
       if (prev.isLive && match.isLive && prev.score !== match.score) {
-        await sendNotification(
-          `🥅 هدف!`,
-          `${match.team1} ${match.score} ${match.team2} | الدقيقة ${match.minute || '?'}`
-        );
+        await sendNotification(`🥅 هدف!`, `${match.team1} ${match.score} ${match.team2} | الدقيقة ${match.minute || '?'}`);
       }
       previousMatches.set(id, { isLive: match.isLive, score: match.score });
     }
@@ -147,11 +136,9 @@ async function checkMatches() {
   }
 }
 
-// ========== تشغيل الفحص كل 30 ثانية ==========
 setInterval(checkMatches, 30_000);
 checkMatches();
 
-// ========== مسار صحي ==========
 app.get('/', (req, res) => {
   res.send('🟢 خادم مراقبة المباريات يعمل');
 });
