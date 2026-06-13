@@ -1,5 +1,5 @@
 // =======================================================
-// app.js - مراقب مباريات مباشرة (محسّن لـ Render)
+// server.js - مراقب مباريات مباشر (يعمل على Render مع تجاوز Cloudflare)
 // =======================================================
 
 const express = require('express');
@@ -13,10 +13,6 @@ puppeteer.use(StealthPlugin());
 const app = express();
 
 // ========== Firebase Admin ==========
-if (!process.env.SERVICE_ACCOUNT_JSON) {
-  console.error('❌ خطأ: متغير البيئة SERVICE_ACCOUNT_JSON غير موجود.');
-  process.exit(1);
-}
 const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -25,23 +21,22 @@ admin.initializeApp({
 const TOPIC = 'matches';
 
 // ========== إعدادات الفحص الذكي ==========
-let CHECK_INTERVAL = 45_000;
+let CHECK_INTERVAL = 45_000;   // يبدأ بـ 45 ثانية
 let intervalId = null;
 let liveCount = 0;
 
 // ========== مسار Chromium المثبت بواسطة Render ==========
-// المسار الافتراضي بعد `npx puppeteer browsers install chrome`
-const CHROMIUM_PATH = puppeteer.executablePath(); // يعمل تلقائياً بعد التثبيت
+const CHROMIUM_PATH = puppeteer.executablePath();
 console.log('📍 مسار Chromium:', CHROMIUM_PATH);
 
-// ========== دالة جلب الصفحة باستخدام Puppeteer ==========
+// ========== جلب الصفحة باستخدام متصفح حقيقي (Puppeteer + Stealth) ==========
 async function fetchPage() {
   const targetUrl = 'https://jdwel.com/today/';
 
-  console.log('🚀 تشغيل المتصفح...');
+  console.log('🚀 [Puppeteer] تشغيل المتصفح...');
   const browser = await puppeteer.launch({
     headless: 'new',
-    executablePath: CHROMIUM_PATH,  // تحديد المسار يدوياً لضمان الاستخدام
+    executablePath: CHROMIUM_PATH,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -54,7 +49,7 @@ async function fetchPage() {
   try {
     const page = await browser.newPage();
 
-    // تمويه المتصفح
+    // تمويه ليبدو كمتصفح طبيعي
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
     );
@@ -63,7 +58,7 @@ async function fetchPage() {
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
     });
 
-    console.log('🌐 التوجه إلى الصفحة...');
+    console.log('🌐 [Puppeteer] التوجه إلى الصفحة...');
     await page.goto(targetUrl, {
       waitUntil: 'networkidle2',
       timeout: 40_000,
@@ -71,22 +66,23 @@ async function fetchPage() {
 
     await page.waitForTimeout(3000);
 
+    // انتظار ظهور قائمة المباريات للتأكد من تحميل المحتوى
     try {
       await page.waitForSelector('.comp_matches_list', { timeout: 10_000 });
-      console.log('✅ ظهرت قائمة المباريات');
+      console.log('✅ [Puppeteer] ظهرت قائمة المباريات');
     } catch (e) {
-      console.warn('⚠️ لم تظهر .comp_matches_list بسرعة، قد يكون الهيكل تغير.');
+      console.warn('⚠️ [Puppeteer] لم تظهر .comp_matches_list، قد يكون الهيكل تغير.');
     }
 
     const html = await page.content();
-    console.log('✅ تم جلب HTML الصفحة بنجاح');
+    console.log('✅ [Puppeteer] تم جلب HTML بنجاح');
     return html;
   } catch (error) {
-    console.error('❌ فشل Puppeteer:', error.message);
+    console.error('❌ [Puppeteer] فشل:', error.message);
     throw error;
   } finally {
     await browser.close();
-    console.log('🧹 تم إغلاق المتصفح');
+    console.log('🧹 [Puppeteer] تم إغلاق المتصفح');
   }
 }
 
@@ -119,7 +115,7 @@ function parseMatches(html) {
       if (minuteEl) {
         const raw = minuteEl.textContent.trim();
         const m = raw.match(/(\d+)(?:\+(\d+))?/);
-        if (m) minute = m[0];
+        if (m) minute = m[0]; // تحتفظ بصيغة "45+2"
       }
 
       const linkEl = matchEl.querySelector('a[href]');
@@ -168,7 +164,7 @@ async function sendNotification(title, body, retry = 2) {
 // ========== الحالة السابقة ==========
 let previousMatches = new Map();
 
-// ========== دورة الفحص ==========
+// ========== دورة الفحص الرئيسية ==========
 async function checkMatches() {
   try {
     console.log('\n🔍 بدء دورة فحص جديدة...');
@@ -183,6 +179,7 @@ async function checkMatches() {
     for (const [id, match] of currentMap) {
       const prev = previousMatches.get(id);
 
+      // حالة 1: مباراة جديدة مباشرة
       if (!prev) {
         if (match.isLive) {
           await sendNotification(
@@ -199,6 +196,7 @@ async function checkMatches() {
         continue;
       }
 
+      // حالة 2: تغيرت الحالة إلى مباشرة
       if (!prev.isLive && match.isLive) {
         await sendNotification(
           `⚽ بداية مباراة`,
@@ -213,6 +211,7 @@ async function checkMatches() {
         continue;
       }
 
+      // حالة 3: هدف (تغيرت النتيجة)
       if (
         prev.isLive &&
         match.isLive &&
@@ -222,6 +221,7 @@ async function checkMatches() {
           `🥅 هدف!`,
           `${match.team1} ${match.score} ${match.team2} | الدقيقة ${match.minute || '?'}`
         );
+        // تحديث الحالة المخزنة
         previousMatches.set(id, {
           isLive: true,
           homeScore: match.homeScore,
@@ -231,7 +231,7 @@ async function checkMatches() {
       }
     }
 
-    // تنظيف المباريات المنتهية
+    // إزالة المباريات التي لم تعد مباشرة (انتهت)
     for (const [id, prev] of previousMatches) {
       if (!currentMap.has(id) && prev.isLive) {
         console.log(`🏁 مباراة ${id} انتهت.`);
@@ -246,6 +246,7 @@ async function checkMatches() {
     CHECK_INTERVAL = Math.min(CHECK_INTERVAL * 1.5, 300_000);
   }
 
+  // إعادة جدولة المؤقت
   clearInterval(intervalId);
   intervalId = setInterval(checkMatches, CHECK_INTERVAL);
 }
@@ -253,7 +254,7 @@ async function checkMatches() {
 // ========== تشغيل أولي ==========
 checkMatches();
 
-// ========== Health Check ==========
+// ========== نقطة فحص الصحة ==========
 app.get('/', (req, res) => {
   res.json({
     status: '🟢 الخادم يعمل',
