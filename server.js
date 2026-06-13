@@ -6,16 +6,15 @@ const admin = require('firebase-admin');
 const app = express();
 
 // ========== إعداد Firebase Admin ==========
-// ضع ملف serviceAccountKey.json في نفس المجلد
+// نقرأ المفتاح من متغير البيئة SERVICE_ACCOUNT_JSON
 const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-// الموضوع الذي سنرسل إليه الإشعارات (FCM Topic)
 const TOPIC = 'matches';
 
-// ========== تحليل HTML الخاص بالموقع ==========
+// ========== تحليل HTML ==========
 function parseMatches(html) {
   const dom = new JSDOM(html);
   const document = dom.window.document;
@@ -23,27 +22,22 @@ function parseMatches(html) {
   const matches = [];
 
   competitions.forEach(comp => {
-    // اسم الدوري
     const leagueEl = comp.querySelector('.comp_separator .main .title') ||
                      comp.querySelector('.comp_separator .main h4.title');
     const league = leagueEl ? leagueEl.textContent.trim() : 'Unknown League';
 
-    // جميع المباريات داخل الدوري
     const matchElements = comp.querySelectorAll('.single_match');
     matchElements.forEach(matchEl => {
       const dataStatus = matchEl.getAttribute('data-view_status');
       const isLive = dataStatus === 'live';
 
-      // أسماء الفرق
       const team1 = matchEl.querySelector('.team.hometeam .the_team')?.textContent.trim() || '';
       const team2 = matchEl.querySelector('.team.awayteam .the_team')?.textContent.trim() || '';
 
-      // النتيجة
       const scoreHome = matchEl.querySelector('.match_score .hometeam')?.textContent.trim() || '0';
       const scoreAway = matchEl.querySelector('.match_score .awayteam')?.textContent.trim() || '0';
       const score = `${scoreHome} - ${scoreAway}`;
 
-      // الدقيقة (إن وجدت)
       let minute = null;
       const minuteEl = matchEl.querySelector('.match_status .status_box span');
       if (minuteEl) {
@@ -51,7 +45,6 @@ function parseMatches(html) {
         if (txt) minute = parseInt(txt);
       }
 
-      // رابط المباراة لاستخراج ID
       const linkEl = matchEl.querySelector('a[href]');
       let matchId = null;
       if (linkEl) {
@@ -72,23 +65,18 @@ function parseMatches(html) {
       });
     });
   });
-
   return matches;
 }
 
-// ========== الحالة السابقة للمباريات (للمقارنة) ==========
-let previousMatches = new Map(); // key: matchId, value: { isLive, score }
+// ========== الحالة السابقة ==========
+let previousMatches = new Map();
 
-// ========== إرسال إشعار FCM إلى الموضوع ==========
+// ========== إرسال إشعار FCM ==========
 async function sendNotification(title, body) {
   const message = {
-    notification: {
-      title,
-      body,
-    },
+    notification: { title, body },
     topic: TOPIC,
   };
-
   try {
     await admin.messaging().send(message);
     console.log('✅ إشعار:', title);
@@ -97,52 +85,62 @@ async function sendNotification(title, body) {
   }
 }
 
-// ========== دالة الفحص الدورية ==========
+// ========== دالة جلب الصفحة مع ترويسة متصفح حقيقية ==========
+async function fetchPage() {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Cache-Control': 'max-age=0',
+  };
+
+  // نجرب 3 مرات
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await fetch('https://jdwel.com/today/', { headers });
+      if (response.ok) return response.text();
+      console.log(`محاولة ${attempt}: HTTP ${response.status}`);
+    } catch (err) {
+      console.log(`محاولة ${attempt}: ${err.message}`);
+    }
+    await new Promise(r => setTimeout(r, 3000)); // انتظر 3 ثوان قبل إعادة المحاولة
+  }
+  throw new Error('Failed to fetch after 3 attempts');
+}
+
+// ========== الفحص الدوري ==========
 async function checkMatches() {
   try {
     console.log('🔍 جلب بيانات الموقع...');
-    const response = await fetch('https://jdwel.com/today/', {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const html = await response.text();
+    const html = await fetchPage();
     const matches = parseMatches(html);
-
-    // المباريات المباشرة فقط
     const liveMatches = matches.filter(m => m.isLive && m.matchId);
     const currentMap = new Map();
     liveMatches.forEach(m => currentMap.set(m.matchId, m));
 
-    // مقارنة بالحالة السابقة
     for (const [id, match] of currentMap) {
       const prev = previousMatches.get(id);
-
       if (!prev) {
-        // مباراة جديدة لم نكن نتابعها
         previousMatches.set(id, { isLive: match.isLive, score: match.score });
         continue;
       }
-
-      // بداية المباراة (لم تكن مباشرة سابقاً)
       if (!prev.isLive && match.isLive) {
         await sendNotification(
           `⚽ بداية مباراة`,
           `${match.team1} 🆚 ${match.team2} (${match.league})`
         );
       }
-
-      // تغير النتيجة (هدف)
       if (prev.isLive && match.isLive && prev.score !== match.score) {
         await sendNotification(
           `🥅 هدف!`,
           `${match.team1} ${match.score} ${match.team2} | الدقيقة ${match.minute || '?'}`
         );
       }
-
-      // تحديث الحالة السابقة
       previousMatches.set(id, { isLive: match.isLive, score: match.score });
     }
-
     console.log(`✅ تم فحص ${liveMatches.length} مباراة مباشرة - ${new Date().toLocaleTimeString()}`);
   } catch (error) {
     console.error('❌ خطأ في checkMatches:', error.message);
@@ -151,9 +149,9 @@ async function checkMatches() {
 
 // ========== تشغيل الفحص كل 30 ثانية ==========
 setInterval(checkMatches, 30_000);
-checkMatches(); // تشغيل أولي
+checkMatches();
 
-// ========== مسار صحي لـ Render ==========
+// ========== مسار صحي ==========
 app.get('/', (req, res) => {
   res.send('🟢 خادم مراقبة المباريات يعمل');
 });
