@@ -5,24 +5,19 @@ const admin = require('firebase-admin');
 
 const app = express();
 
-// ========== Firebase Admin ==========
+// Firebase Admin
 const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
-
 const TOPIC = 'matches';
 
-// ========== تحليل HTML ==========
+// تحليل HTML
 function parseMatches(html) {
   const dom = new JSDOM(html);
   const document = dom.window.document;
   const competitions = document.querySelectorAll('.comp_matches_list');
   const matches = [];
-
-  if (competitions.length === 0) {
-    console.warn('⚠️ لم يتم العثور على أي مسابقة (قد يكون تنسيق الصفحة تغير).');
-  }
 
   competitions.forEach(comp => {
     const leagueEl = comp.querySelector('.comp_separator .main .title') ||
@@ -57,38 +52,23 @@ function parseMatches(html) {
       }
 
       matches.push({
-        league,
-        team1,
-        team2,
-        score,
-        isLive,
-        minute,
-        matchId,
-        dataStatus,
+        league, team1, team2, score, isLive, minute, matchId, dataStatus,
       });
     });
   });
   return matches;
 }
 
-// ========== الحالة السابقة مع حماية من الفقد المؤقت ==========
-let previousMatches = new Map();            // key: matchId => { isLive, score }
-let missingCounter = new Map();             // key: matchId => عدد المرات التي اختفت فيها المباراة
-const MISSING_THRESHOLD = 3;                // لا نحذف حتى تختفي 3 مرات متتالية (لتجنب الحذف بسبب فشل الجلب)
+// تخزين الحالة السابقة
+let previousMatches = new Map();
 
-// ========== آلية قفل لمنع التداخل ==========
-let isChecking = false;
-
-// ========== إرسال إشعار مع إعادة محاولة ==========
+// إرسال إشعار مع إعادة محاولة
 async function sendNotification(title, body, retry = 2) {
-  const message = {
-    notification: { title, body },
-    topic: TOPIC,
-  };
+  const message = { notification: { title, body }, topic: TOPIC };
   for (let i = 0; i < retry; i++) {
     try {
       await admin.messaging().send(message);
-      console.log('✅ إشعار:', title);
+      console.log(`✅ إشعار: ${title}`);
       return;
     } catch (error) {
       console.error(`❌ محاولة ${i+1} فشلت:`, error.message);
@@ -97,23 +77,19 @@ async function sendNotification(title, body, retry = 2) {
   }
 }
 
-// ========== جلب الصفحة عبر وسيط مع مهلة ==========
+// جلب الصفحة عبر proxy مع fallback
 async function fetchPage() {
   const proxyUrls = [
     `https://api.allorigins.win/raw?url=${encodeURIComponent('https://jdwel.com/today/')}`,
     `https://corsproxy.io/?${encodeURIComponent('https://jdwel.com/today/')}`,
   ];
-
   for (let url of proxyUrls) {
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 8000);
       const response = await fetch(url, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-        signal: controller.signal
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProxyBot/1.0)' },
+        timeout: 10000,
       });
-      clearTimeout(timeoutId);
-      if (response.ok) return response.text();
+      if (response.ok) return await response.text();
       console.log(`وكيل ${url} أعاد HTTP ${response.status}`);
     } catch (err) {
       console.log(`فشل الوكيل ${url}: ${err.message}`);
@@ -122,119 +98,55 @@ async function fetchPage() {
   throw new Error('All proxies failed');
 }
 
-// ========== الفحص الرئيسي (كل 15 ثانية) ==========
-let firstRun = true; // لتجاهل إشعارات التشغيل الأول
-
+// الفحص الدوري
 async function checkMatches() {
-  if (isChecking) {
-    console.log('⏳ الفحص السابق لم ينته بعد، تجاوز هذه الدورة.');
-    return;
-  }
-  isChecking = true;
   try {
-    console.log('🔍 جلب بيانات الموقع...');
+    console.log('🔍 جلب البيانات...');
     const html = await fetchPage();
     const matches = parseMatches(html);
     const liveMatches = matches.filter(m => m.isLive && m.matchId);
     const currentMap = new Map();
     liveMatches.forEach(m => currentMap.set(m.matchId, m));
 
-    // معالجة المباريات الموجودة حاليًا
     for (const [id, match] of currentMap) {
       const prev = previousMatches.get(id);
-
-      // إعادة تعيين عداد الاختفاء لأن المباراة موجودة
-      missingCounter.delete(id);
-
-      // حالة مباراة جديدة (أو عادت بعد اختفاء مؤقت)
-      if (!prev) {
-        if (!firstRun) {
-          // فقط أرسل إشعار إذا لم تكن أول تشغيل
-          await sendNotification(`⚽ بداية مباراة`, `${match.team1} 🆚 ${match.team2} (${match.league})`);
-        }
-        previousMatches.set(id, { isLive: true, score: match.score });
+      if (!prev && match.isLive) {
+        await sendNotification(`⚽ بداية مباراة`, `${match.team1} 🆚 ${match.team2} (${match.league})`);
+        previousMatches.set(id, { isLive: true, score: match.score, minute: match.minute });
         continue;
       }
-
       if (prev) {
-        // بداية المباراة: كانت غير مباشرة ثم أصبحت مباشرة
         if (!prev.isLive && match.isLive) {
           await sendNotification(`⚽ بداية مباراة`, `${match.team1} 🆚 ${match.team2} (${match.league})`);
         }
-        // هدف: تغير النتيجة
         if (prev.isLive && match.isLive && prev.score !== match.score) {
           await sendNotification(`🥅 هدف!`, `${match.team1} ${match.score} ${match.team2} | الدقيقة ${match.minute || '?'}`);
         }
-        // تحديث الحالة المخزنة
-        previousMatches.set(id, { isLive: match.isLive, score: match.score });
+        previousMatches.set(id, { isLive: match.isLive, score: match.score, minute: match.minute });
       }
     }
-
-    // معالجة المباريات التي لم تعد موجودة في الجلب الحالي
+    // إزالة المنتهية
     for (const [id, prev] of previousMatches) {
-      if (!currentMap.has(id)) {
-        const missCount = (missingCounter.get(id) || 0) + 1;
-        missingCounter.set(id, missCount);
-        if (missCount >= MISSING_THRESHOLD) {
-          console.log(`🏁 مباراة ${id} انتهت (اختفت لـ ${missCount} دورة).`);
-          previousMatches.delete(id);
-          missingCounter.delete(id);
-        } else {
-          console.log(`❓ مباراة ${id} مختفية (${missCount}/${MISSING_THRESHOLD})، لم نحذف بعد.`);
-        }
+      if (!currentMap.has(id) && prev.isLive) {
+        console.log(`🏁 مباراة ${id} انتهت.`);
+        previousMatches.delete(id);
       }
     }
-
-    // بعد أول تشغيل ناجح، نسمح بالإشعارات
-    if (firstRun) {
-      firstRun = false;
-      console.log('🔕 أول تشغيل اكتمل، تم تجاهل الإشعارات.');
-    }
-
-    console.log(`✅ فحص: ${liveMatches.length} مباراة مباشرة - ${new Date().toLocaleTimeString()}`);
+    console.log(`✅ تم فحص ${liveMatches.length} مباراة مباشرة - ${new Date().toLocaleTimeString()}`);
   } catch (error) {
-    console.error('❌ خطأ في checkMatches:', error.message);
-    // لا نحذف المباريات بسبب خطأ مؤقت (لأننا لا ننشئ currentMap جديداً هنا)
-  } finally {
-    isChecking = false;
+    console.error('❌ خطأ:', error.message);
   }
 }
 
-// ========== تشغيل الفحص الدوري (كل 15 ثانية) ==========
-const CHECK_INTERVAL_MS = 15000; // 15 ثانية – أكثر استقراراً للموقع والوكلاء
-setInterval(checkMatches, CHECK_INTERVAL_MS);
+// فاصل زمني ديناميكي (10-12 ثانية)
+setInterval(() => {
+  checkMatches().catch(console.error);
+}, 10000 + Math.random() * 2000);
 
-// تشغيل أولي فوري
 checkMatches();
 
-// ========== خادم Express ==========
-app.get('/', (req, res) => {
-  res.send('🟢 خادم مراقبة المباريات (فحص كل 15 ثانية)');
-});
-
-// نقطة فحص يدوية
-app.get('/check', async (req, res) => {
-  try {
-    const html = await fetchPage();
-    const matches = parseMatches(html);
-    res.json({ count: matches.length, matches });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// حالة الخادم
-app.get('/status', (req, res) => {
-  res.json({
-    running: true,
-    checking: isChecking,
-    liveMatchesStored: previousMatches.size,
-    nextCheckIn: CHECK_INTERVAL_MS,
-    firstRunCompleted: !firstRun,
-  });
-});
+app.get('/', (req, res) => res.send('🟢 خادم مراقبة المباريات يعمل'));
+app.get('/health', (req, res) => res.send('OK'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 الخادم يستمع على المنفذ ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 الخادم على المنفذ ${PORT}`));
