@@ -11,5 +11,6 @@
     "node-fetch": "^2.7.0",
     "jsdom": "^24.1.0",
     "firebase-admin": "^12.2.0"
+      "puppeteer": "^21.0.0"
   }
 }
