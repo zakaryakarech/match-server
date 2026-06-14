@@ -12,7 +12,55 @@ admin.initializeApp({
 });
 const TOPIC = 'matches';
 
-// تحليل HTML
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// قائمة وكلاء احتياطيين (جرب كل واحد)
+const PROXIES = [
+  null, // طلب مباشر أولاً
+  'https://cors-anywhere.herokuapp.com/',
+  'https://proxy.cors.sh/',
+  'https://api.allorigins.win/raw?url=',
+  'https://corsproxy.io/?'  // نفس القديم لكن قد ينجح أحياناً
+];
+
+async function fetchWithProxy(url, proxyUrl) {
+  const fullUrl = proxyUrl ? `${proxyUrl}${encodeURIComponent(url)}` : url;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(fullUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'ar,en;q=0.9',
+        'Referer': 'https://www.google.com/',
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (response.ok) {
+      const html = await response.text();
+      return html;
+    }
+    console.log(`❌ ${proxyUrl || 'direct'} => HTTP ${response.status}`);
+    return null;
+  } catch (err) {
+    clearTimeout(timeout);
+    console.log(`❌ ${proxyUrl || 'direct'} => ${err.message}`);
+    return null;
+  }
+}
+
+async function fetchPage() {
+  for (const proxy of PROXIES) {
+    const html = await fetchWithProxy('https://jdwel.com/today/', proxy);
+    if (html) return html;
+    await delay(1000);
+  }
+  throw new Error('All proxies failed');
+}
+
+// تحليل HTML (بدون تغيير)
 function parseMatches(html) {
   const dom = new JSDOM(html);
   const document = dom.window.document;
@@ -59,10 +107,8 @@ function parseMatches(html) {
   return matches;
 }
 
-// تخزين الحالة السابقة
 let previousMatches = new Map();
 
-// إرسال إشعار مع إعادة محاولة
 async function sendNotification(title, body, retry = 2) {
   const message = { notification: { title, body }, topic: TOPIC };
   for (let i = 0; i < retry; i++) {
@@ -72,37 +118,18 @@ async function sendNotification(title, body, retry = 2) {
       return;
     } catch (error) {
       console.error(`❌ محاولة ${i+1} فشلت:`, error.message);
-      if (i < retry-1) await new Promise(r => setTimeout(r, 2000));
+      if (i < retry-1) await delay(2000);
     }
   }
 }
 
-// جلب الصفحة عبر proxy مع fallback
-async function fetchPage() {
-  const proxyUrls = [
-    `https://api.allorigins.win/raw?url=${encodeURIComponent('https://jdwel.com/today/')}`,
-    `https://corsproxy.io/?${encodeURIComponent('https://jdwel.com/today/')}`,
-  ];
-  for (let url of proxyUrls) {
-    try {
-      const response = await fetch(url, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProxyBot/1.0)' },
-        timeout: 10000,
-      });
-      if (response.ok) return await response.text();
-      console.log(`وكيل ${url} أعاد HTTP ${response.status}`);
-    } catch (err) {
-      console.log(`فشل الوكيل ${url}: ${err.message}`);
-    }
-  }
-  throw new Error('All proxies failed');
-}
+let consecutiveFailures = 0;
 
-// الفحص الدوري
 async function checkMatches() {
   try {
     console.log('🔍 جلب البيانات...');
     const html = await fetchPage();
+    consecutiveFailures = 0;
     const matches = parseMatches(html);
     const liveMatches = matches.filter(m => m.isLive && m.matchId);
     const currentMap = new Map();
@@ -125,7 +152,6 @@ async function checkMatches() {
         previousMatches.set(id, { isLive: match.isLive, score: match.score, minute: match.minute });
       }
     }
-    // إزالة المنتهية
     for (const [id, prev] of previousMatches) {
       if (!currentMap.has(id) && prev.isLive) {
         console.log(`🏁 مباراة ${id} انتهت.`);
@@ -134,18 +160,28 @@ async function checkMatches() {
     }
     console.log(`✅ تم فحص ${liveMatches.length} مباراة مباشرة - ${new Date().toLocaleTimeString()}`);
   } catch (error) {
-    console.error('❌ خطأ:', error.message);
+    consecutiveFailures++;
+    console.error(`❌ خطأ (${consecutiveFailures}):`, error.message);
   }
 }
 
-// فاصل زمني ديناميكي (10-12 ثانية)
-setInterval(() => {
-  checkMatches().catch(console.error);
-}, 10000 + Math.random() * 2000);
+// الفاصل الزمني: 15 ثانية عادة، لكن يزيد تدريجياً عند الفشل
+async function scheduler() {
+  let interval = 15000;
+  while (true) {
+    await checkMatches();
+    if (consecutiveFailures > 3) {
+      interval = 60000; // بعد 3 فشل متتالي، انتظر دقيقة
+    } else {
+      interval = 15000 + Math.random() * 5000;
+    }
+    await delay(interval);
+  }
+}
 
-checkMatches();
+scheduler();
 
-app.get('/', (req, res) => res.send('🟢 خادم مراقبة المباريات يعمل'));
+app.get('/', (req, res) => res.send('🟢 خادم مراقبة المباريات يعمل (محسن)'));
 app.get('/health', (req, res) => res.send('OK'));
 
 const PORT = process.env.PORT || 3000;
