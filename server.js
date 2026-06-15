@@ -5,62 +5,15 @@ const admin = require('firebase-admin');
 
 const app = express();
 
-// Firebase Admin
+// ========== Firebase Admin ==========
 const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
+
 const TOPIC = 'matches';
 
-const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-// قائمة وكلاء احتياطيين (جرب كل واحد)
-const PROXIES = [
-  null, // طلب مباشر أولاً
-  'https://cors-anywhere.herokuapp.com/',
-  'https://proxy.cors.sh/',
-  'https://api.allorigins.win/raw?url=',
-  'https://corsproxy.io/?'  // نفس القديم لكن قد ينجح أحياناً
-];
-
-async function fetchWithProxy(url, proxyUrl) {
-  const fullUrl = proxyUrl ? `${proxyUrl}${encodeURIComponent(url)}` : url;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
-  try {
-    const response = await fetch(fullUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'ar,en;q=0.9',
-        'Referer': 'https://www.google.com/',
-      },
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-    if (response.ok) {
-      const html = await response.text();
-      return html;
-    }
-    console.log(`❌ ${proxyUrl || 'direct'} => HTTP ${response.status}`);
-    return null;
-  } catch (err) {
-    clearTimeout(timeout);
-    console.log(`❌ ${proxyUrl || 'direct'} => ${err.message}`);
-    return null;
-  }
-}
-
-async function fetchPage() {
-  for (const proxy of PROXIES) {
-    const html = await fetchWithProxy('https://jdwel.com/today/', proxy);
-    if (html) return html;
-    await delay(1000);
-  }
-  throw new Error('All proxies failed');
-}
-
-// تحليل HTML (بدون تغيير)
+// ========== تحليل HTML (نفس السابق) ==========
 function parseMatches(html) {
   const dom = new JSDOM(html);
   const document = dom.window.document;
@@ -100,36 +53,68 @@ function parseMatches(html) {
       }
 
       matches.push({
-        league, team1, team2, score, isLive, minute, matchId, dataStatus,
+        league,
+        team1,
+        team2,
+        score,
+        isLive,
+        minute,
+        matchId,
+        dataStatus,
       });
     });
   });
   return matches;
 }
 
+// ========== الحالة السابقة ==========
 let previousMatches = new Map();
 
+// ========== إرسال إشعار مع إعادة محاولة ==========
 async function sendNotification(title, body, retry = 2) {
-  const message = { notification: { title, body }, topic: TOPIC };
+  const message = {
+    notification: { title, body },
+    topic: TOPIC,
+  };
   for (let i = 0; i < retry; i++) {
     try {
       await admin.messaging().send(message);
-      console.log(`✅ إشعار: ${title}`);
+      console.log('✅ إشعار:', title);
       return;
     } catch (error) {
       console.error(`❌ محاولة ${i+1} فشلت:`, error.message);
-      if (i < retry-1) await delay(2000);
+      if (i < retry-1) await new Promise(r => setTimeout(r, 2000));
     }
   }
 }
 
-let consecutiveFailures = 0;
+// ========== جلب الصفحة عبر وكيل ==========
+async function fetchPage() {
+  // قائمة بالوكلاء الاحتياطيين
+  const proxyUrls = [
+    `https://api.allorigins.win/raw?url=${encodeURIComponent('https://jdwel.com/today/')}`,
+    `https://corsproxy.io/?${encodeURIComponent('https://jdwel.com/today/')}`,
+  ];
 
+  for (let url of proxyUrls) {
+    try {
+      const response = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProxyBot/1.0)' }
+      });
+      if (response.ok) return response.text();
+      console.log(`وكيل ${url} أعاد HTTP ${response.status}`);
+    } catch (err) {
+      console.log(`فشل الوكيل ${url}: ${err.message}`);
+    }
+  }
+  throw new Error('All proxies failed');
+}
+
+// ========== الفحص الدوري (محسّن) ==========
 async function checkMatches() {
   try {
-    console.log('🔍 جلب البيانات...');
+    console.log('🔍 جلب بيانات الموقع عبر وكيل...');
     const html = await fetchPage();
-    consecutiveFailures = 0;
     const matches = parseMatches(html);
     const liveMatches = matches.filter(m => m.isLive && m.matchId);
     const currentMap = new Map();
@@ -137,52 +122,54 @@ async function checkMatches() {
 
     for (const [id, match] of currentMap) {
       const prev = previousMatches.get(id);
+
+      // حالة 1: مباراة جديدة تماماً (غير موجودة سابقاً) وهي مباشرة → إرسال بداية
       if (!prev && match.isLive) {
         await sendNotification(`⚽ بداية مباراة`, `${match.team1} 🆚 ${match.team2} (${match.league})`);
-        previousMatches.set(id, { isLive: true, score: match.score, minute: match.minute });
+        previousMatches.set(id, { isLive: true, score: match.score });
         continue;
       }
+
       if (prev) {
+        // بداية المباراة: كانت غير مباشرة والآن مباشرة
         if (!prev.isLive && match.isLive) {
           await sendNotification(`⚽ بداية مباراة`, `${match.team1} 🆚 ${match.team2} (${match.league})`);
         }
+        // تسجيل هدف: تغيرت النسبة والمباراة مباشرة
         if (prev.isLive && match.isLive && prev.score !== match.score) {
           await sendNotification(`🥅 هدف!`, `${match.team1} ${match.score} ${match.team2} | الدقيقة ${match.minute || '?'}`);
         }
-        previousMatches.set(id, { isLive: match.isLive, score: match.score, minute: match.minute });
+        // تحديث الحالة المخزنة
+        previousMatches.set(id, { isLive: match.isLive, score: match.score });
       }
     }
+
+    // إزالة المباريات التي لم تعد مباشرة (انتهت)
     for (const [id, prev] of previousMatches) {
       if (!currentMap.has(id) && prev.isLive) {
         console.log(`🏁 مباراة ${id} انتهت.`);
         previousMatches.delete(id);
       }
     }
+
     console.log(`✅ تم فحص ${liveMatches.length} مباراة مباشرة - ${new Date().toLocaleTimeString()}`);
   } catch (error) {
-    consecutiveFailures++;
-    console.error(`❌ خطأ (${consecutiveFailures}):`, error.message);
+    console.error('❌ خطأ في checkMatches:', error.message);
   }
 }
 
-// الفاصل الزمني: 15 ثانية عادة، لكن يزيد تدريجياً عند الفشل
-async function scheduler() {
-  let interval = 15000;
-  while (true) {
-    await checkMatches();
-    if (consecutiveFailures > 3) {
-      interval = 60000; // بعد 3 فشل متتالي، انتظر دقيقة
-    } else {
-      interval = 15000 + Math.random() * 5000;
-    }
-    await delay(interval);
-  }
-}
+// ========== تقليل الفاصل الزمني لالتقاط الأهداف بشكل أسرع ==========
+setInterval(checkMatches, 15_000);  // من 30 ثانية إلى 15 ثانية
 
-scheduler();
+// تنفيذ أول فوراً
+checkMatches();
 
-app.get('/', (req, res) => res.send('🟢 خادم مراقبة المباريات يعمل (محسن)'));
-app.get('/health', (req, res) => res.send('OK'));
+// ========== خادم Express ==========
+app.get('/', (req, res) => {
+  res.send('🟢 خادم مراقبة المباريات يعمل مع تحسين الإشعارات');
+});
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 الخادم على المنفذ ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 الخادم يستمع على المنفذ ${PORT}`);
+});
