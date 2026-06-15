@@ -13,7 +13,7 @@ admin.initializeApp({
 
 const TOPIC = 'matches';
 
-// ========== تحليل HTML (نفس السابق) ==========
+// ========== تحليل HTML ==========
 function parseMatches(html) {
   const dom = new JSDOM(html);
   const document = dom.window.document;
@@ -70,7 +70,7 @@ function parseMatches(html) {
 // ========== الحالة السابقة ==========
 let previousMatches = new Map();
 
-// ========== إرسال إشعار مع إعادة محاولة ==========
+// ========== إرسال إشعار ==========
 async function sendNotification(title, body, retry = 2) {
   const message = {
     notification: { title, body },
@@ -88,85 +88,93 @@ async function sendNotification(title, body, retry = 2) {
   }
 }
 
-// ========== جلب الصفحة عبر وكيل ==========
+// ========== جلب الصفحة عبر ScrapingBee ==========
 async function fetchPage() {
-  // قائمة بالوكلاء الاحتياطيين
-  const proxyUrls = [
-    `https://api.allorigins.win/raw?url=${encodeURIComponent('https://jdwel.com/today/')}`,
-    `https://corsproxy.io/?${encodeURIComponent('https://jdwel.com/today/')}`,
-  ];
-
-  for (let url of proxyUrls) {
-    try {
-      const response = await fetch(url, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProxyBot/1.0)' }
-      });
-      if (response.ok) return response.text();
-      console.log(`وكيل ${url} أعاد HTTP ${response.status}`);
-    } catch (err) {
-      console.log(`فشل الوكيل ${url}: ${err.message}`);
-    }
+  const apiKey = process.env.SCRAPINGBEE_API_KEY;
+  if (!apiKey) {
+    throw new Error('SCRAPINGBEE_API_KEY غير موجود في المتغيرات البيئية');
   }
-  throw new Error('All proxies failed');
+
+  const url = `https://app.scrapingbee.com/api/v1/?api_key=${apiKey}&url=${encodeURIComponent('https://jdwel.com/today/')}&render_js=false&premium_proxy=true&country_code=eg`;
+  
+  try {
+    console.log('🔍 جلب البيانات عبر ScrapingBee...');
+    const response = await fetch(url);
+    
+    if (!response.ok) {
+      throw new Error(`ScrapingBee HTTP ${response.status}`);
+    }
+    
+    const html = await response.text();
+    
+    // التحقق من أن المحتوى فعلاً HTML وليس صفحة خطأ
+    if (html.includes('jdwel.com') || html.includes('single_match')) {
+      console.log('✅ تم جلب البيانات بنجاح');
+      return html;
+    } else {
+      throw new Error('المحتوى المستلم ليس HTML صالح');
+    }
+  } catch (error) {
+    console.error('❌ فشل ScrapingBee:', error.message);
+    throw error;
+  }
 }
 
-// ========== الفحص الدوري (محسّن) ==========
+// ========== الفحص الدوري ==========
 async function checkMatches() {
   try {
-    console.log('🔍 جلب بيانات الموقع عبر وكيل...');
     const html = await fetchPage();
     const matches = parseMatches(html);
     const liveMatches = matches.filter(m => m.isLive && m.matchId);
     const currentMap = new Map();
     liveMatches.forEach(m => currentMap.set(m.matchId, m));
 
+    // فحص المباريات الجديدة والمحدثة
     for (const [id, match] of currentMap) {
       const prev = previousMatches.get(id);
 
-      // حالة 1: مباراة جديدة تماماً (غير موجودة سابقاً) وهي مباشرة → إرسال بداية
-      if (!prev && match.isLive) {
+      // مباراة جديدة مباشرة
+      if (!prev) {
         await sendNotification(`⚽ بداية مباراة`, `${match.team1} 🆚 ${match.team2} (${match.league})`);
         previousMatches.set(id, { isLive: true, score: match.score });
         continue;
       }
 
-      if (prev) {
-        // بداية المباراة: كانت غير مباشرة والآن مباشرة
-        if (!prev.isLive && match.isLive) {
-          await sendNotification(`⚽ بداية مباراة`, `${match.team1} 🆚 ${match.team2} (${match.league})`);
-        }
-        // تسجيل هدف: تغيرت النسبة والمباراة مباشرة
-        if (prev.isLive && match.isLive && prev.score !== match.score) {
-          await sendNotification(`🥅 هدف!`, `${match.team1} ${match.score} ${match.team2} | الدقيقة ${match.minute || '?'}`);
-        }
-        // تحديث الحالة المخزنة
-        previousMatches.set(id, { isLive: match.isLive, score: match.score });
+      // بداية المباراة (كانت غير مباشرة)
+      if (!prev.isLive && match.isLive) {
+        await sendNotification(`⚽ بداية مباراة`, `${match.team1} 🆚 ${match.team2} (${match.league})`);
       }
+      
+      // تسجيل هدف
+      if (prev.isLive && match.isLive && prev.score !== match.score) {
+        await sendNotification(`🥅 هدف!`, `${match.team1} ${match.score} ${match.team2} | الدقيقة ${match.minute || '?'}`);
+      }
+      
+      // تحديث الحالة
+      previousMatches.set(id, { isLive: match.isLive, score: match.score });
     }
 
-    // إزالة المباريات التي لم تعد مباشرة (انتهت)
+    // إزالة المباريات المنتهية
     for (const [id, prev] of previousMatches) {
-      if (!currentMap.has(id) && prev.isLive) {
+      if (!currentMap.has(id)) {
         console.log(`🏁 مباراة ${id} انتهت.`);
         previousMatches.delete(id);
       }
     }
 
-    console.log(`✅ تم فحص ${liveMatches.length} مباراة مباشرة - ${new Date().toLocaleTimeString()}`);
+    console.log(`✅ تم فحص ${liveMatches.length} مباراة مباشرة - ${new Date().toLocaleTimeString('ar-EG')}`);
   } catch (error) {
     console.error('❌ خطأ في checkMatches:', error.message);
   }
 }
 
-// ========== تقليل الفاصل الزمني لالتقاط الأهداف بشكل أسرع ==========
-setInterval(checkMatches, 15_000);  // من 30 ثانية إلى 15 ثانية
-
-// تنفيذ أول فوراً
-checkMatches();
+// ========== تشغيل الفحص الدوري ==========
+setInterval(checkMatches, 30_000); // كل 30 ثانية
+checkMatches(); // أول فحص فوري
 
 // ========== خادم Express ==========
 app.get('/', (req, res) => {
-  res.send('🟢 خادم مراقبة المباريات يعمل مع تحسين الإشعارات');
+  res.send('🟢 خادم مراقبة المباريات يعمل مع ScrapingBee');
 });
 
 const PORT = process.env.PORT || 3000;
